@@ -1,0 +1,30 @@
+# Bytecode / packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Local scan artifacts (regenerate via CLI; never commit account data)
+data/*.json
+*.sqlite3
+*.db
+
+# Secrets — should never exist, but defense in depth
+.env
+*.pem
+
+# Ignore all raw account data and graphs
+data/*.json
+data/*.html
+
+# Exception: Allow the README screenshot to be committed
+!data/attack_paths.png
