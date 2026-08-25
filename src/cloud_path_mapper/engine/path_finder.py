@@ -37,7 +37,6 @@ PATH_CUTOFF = 5
 MAX_PATHS = 500
 
 ENTRY_NODE_TYPES = {"user", "ec2_instance"}
-ADMIN_NAME_MARKER = "admin"
 
 
 def load_graph(path: Any = GRAPH_PATH) -> nx.DiGraph:
@@ -62,38 +61,47 @@ def load_graph(path: Any = GRAPH_PATH) -> nx.DiGraph:
 def find_entry_points(graph: nx.DiGraph) -> list[str]:
     """Select attacker entry-point nodes.
 
+    Identities that already carry a ``target_reason`` (i.e., are
+    themselves high-value targets) are excluded as origins: an
+    already-admin identity using its own access is normal operation,
+    not privilege escalation. Such nodes remain fully usable as
+    intermediate hops or destinations within someone else's path.
+
     Args:
         graph: The attack graph.
 
     Returns:
         Sorted list of ARNs whose ``node_type`` is a user or EC2
-        instance.
+        instance and which are not themselves flagged targets.
     """
     return sorted(
         node for node, attrs in graph.nodes(data=True)
         if attrs.get("node_type") in ENTRY_NODE_TYPES
+        and not attrs.get("target_reason")
     )
 
 
 def find_high_value_targets(graph: nx.DiGraph) -> list[str]:
     """Select high-value target nodes.
 
+    A node is a target when it is an S3 bucket, or when the graph
+    builder tagged it with a ``target_reason`` attribute — which is
+    set from policy-content evaluation (AdministratorAccess, IAM-write
+    actions, sensitive service wildcards) and/or the legacy admin-name
+    heuristic. The reason travels with the node so reports can show
+    reviewers WHY something is a target.
+
     Args:
         graph: The attack graph.
 
     Returns:
-        Sorted list of ARNs for S3 bucket nodes plus roles whose name
-        contains "admin" (case-insensitive).
+        Sorted list of ARNs for S3 bucket nodes plus flagged identity
+        nodes.
     """
     targets = [
         node for node, attrs in graph.nodes(data=True)
-        if attrs.get("node_type") == "s3_bucket"
+        if attrs.get("node_type") == "s3_bucket" or attrs.get("target_reason")
     ]
-    targets.extend(
-        node for node, attrs in graph.nodes(data=True)
-        if attrs.get("node_type") == "role"
-        and ADMIN_NAME_MARKER in str(attrs.get("name", "")).lower()
-    )
     return sorted(set(targets))
 
 
@@ -168,8 +176,50 @@ def find_attack_paths(
     paths.sort(key=lambda p: p["hops"])
     if truncated:
         logger.warning("Path enumeration hit the %d-path cap; output is not exhaustive.", max_paths)
+
+    before = len(paths)
+    paths = _collapse_prefix_paths(paths)
+    if len(paths) != before:
+        logger.info(
+            "Collapsed %d prefix path(s); %d distinct route(s) remain",
+            before - len(paths),
+            len(paths),
+        )
+
     logger.info("Discovered %d attack path(s) (cutoff=%d)", len(paths), cutoff)
     return paths
+
+
+def _collapse_prefix_paths(paths: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop paths that are strict prefixes of a longer reported path.
+
+    When one enumerated path's node sequence is a literal prefix of
+    another (e.g., ``A -> B`` vs ``A -> B -> C -> Target``), only the
+    longer path is kept: the shorter one is just a truncated view of
+    the same underlying route. Paths that share a common prefix but
+    diverge to different final nodes (``A -> B -> X`` vs
+    ``A -> B -> Y``) are NOT prefixes of each other and both survive.
+
+    Args:
+        paths: Path records (each with a ``nodes`` list).
+
+    Returns:
+        Filtered list preserving input order.
+    """
+
+    def is_strict_prefix_of(candidate: dict[str, Any], other: dict[str, Any]) -> bool:
+        cand_nodes = candidate["nodes"]
+        other_nodes = other["nodes"]
+        return len(other_nodes) > len(cand_nodes) and other_nodes[: len(cand_nodes)] == cand_nodes
+
+    kept: list[dict[str, Any]] = []
+    for candidate in paths:
+        dominated = any(
+            is_strict_prefix_of(candidate, other) for other in paths if other is not candidate
+        )
+        if not dominated:
+            kept.append(candidate)
+    return kept
 
 
 def format_path(path: dict[str, Any]) -> str:

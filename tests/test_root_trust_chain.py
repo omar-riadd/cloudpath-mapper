@@ -239,6 +239,88 @@ def test_wildcard_resource_grant_resolves():
     assert (f"arn:aws:iam::{ACCT}:role/AdminRole", f"arn:aws:iam::{ACCT}:role/PivotRoleB") in relations
 
 
+def test_named_principal_without_grant_is_not_an_edge():
+    """Trust names identity-x but identity-x has no AssumeRole grant.
+
+    The exploitable edge must NOT exist; instead a TrustedButNoGrant
+    informational finding is recorded for reviewer visibility.
+    """
+    identity_x = f"arn:aws:iam::{ACCT}:user/identity-x"
+    iam = {
+        "account_id": ACCT,
+        "users": [
+            {
+                "type": "user",
+                "name": "identity-x",
+                "arn": identity_x,
+                "groups": [],
+                # S3 read only — deliberately no sts:AssumeRole anywhere.
+                "attached_policy_arns": [],
+                "inline_policies": {
+                    "OnlyS3": {
+                        "Statement": [
+                            {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}
+                        ]
+                    }
+                },
+            }
+        ],
+        "roles": [
+            _role(
+                "NamedOnlyRole",
+                [{"Effect": "Allow", "Principal": {"AWS": identity_x}, "Action": "sts:AssumeRole"}],
+            )
+        ],
+        "groups": [],
+        "instance_profiles": [],
+        "policies": {},
+    }
+    builder = AttackGraphBuilder(iam, {"buckets": []}, {"instances": []})
+    g = builder.build()
+
+    assert not g.has_edge(identity_x, f"arn:aws:iam::{ACCT}:role/NamedOnlyRole")
+
+    findings = [f for f in builder.informational_findings if f["type"] == "TrustedButNoGrant"]
+    assert len(findings) == 1
+    assert findings[0]["identity"] == identity_x
+    assert findings[0]["role"] == f"arn:aws:iam::{ACCT}:role/NamedOnlyRole"
+
+
+def test_named_principal_with_grant_still_creates_edge():
+    """Two-sided check passes when BOTH naming and grant exist."""
+    iam = {
+        "account_id": ACCT,
+        "users": [
+            {
+                "type": "user",
+                "name": "dev-user1",
+                "arn": USER,
+                "groups": [],
+                "attached_policy_arns": [],
+                "inline_policies": _assume_inline(PIVOT),
+            }
+        ],
+        "roles": [
+            # Trusts dev-user1 by name AND root — named takes precedence.
+            _role(
+                "PivotRoleB",
+                [
+                    {"Effect": "Allow", "Principal": {"AWS": USER}, "Action": "sts:AssumeRole"},
+                    {"Effect": "Allow", "Principal": {"AWS": ROOT}, "Action": "sts:AssumeRole"},
+                ],
+            )
+        ],
+        "groups": [],
+        "instance_profiles": [],
+        "policies": {},
+    }
+    builder = AttackGraphBuilder(iam, {"buckets": []}, {"instances": []})
+    g = builder.build()
+    edge_data = g.get_edge_data(USER, PIVOT)
+    assert edge_data and edge_data["basis"] == "named-principal"
+    assert not [f for f in builder.informational_findings if f["type"] == "TrustedButNoGrant"]
+
+
 if __name__ == "__main__":
     test_three_hop_root_trust_chain_is_fully_resolved()
     test_full_attack_path_engine_sees_the_chain()
@@ -246,4 +328,6 @@ if __name__ == "__main__":
     test_deny_statement_suppresses_edge()
     test_conditioned_root_trust_is_not_resolved()
     test_wildcard_resource_grant_resolves()
+    test_named_principal_without_grant_is_not_an_edge()
+    test_named_principal_with_grant_still_creates_edge()
     print("ALL ROOT-TRUST RESOLUTION TESTS PASS")

@@ -208,15 +208,35 @@ def main(argv: list[str] | None = None) -> int:
 
         paths = path_finder.find_attack_paths(graph, cutoff=args.cutoff)
 
+        targets = [
+            (node, attrs) for node, attrs in graph.nodes(data=True)
+            if attrs.get("target_reason")
+        ]
+        if targets:
+            print(f"\n=== High-Value Targets ({len(targets)}) ===")
+            for node, attrs in sorted(targets, key=lambda t: t[1].get("name", "")):
+                print(f"  {attrs.get('name')} [{attrs.get('node_type')}] — {attrs['target_reason']}")
+
         print(f"\n=== Attack Paths ({len(paths)} found, max {args.cutoff} hops) ===")
         if not paths:
             print("No attack paths discovered from entry points to high-value targets.")
         for rank, path in enumerate(paths, start=1):
             print(f"{rank:>3}. [{path['hops']} hops] {path_finder.format_path(path)}")
 
+        findings = graph_builder.load_informational_findings()
+        if findings:
+            print(f"\n=== Half-Configured Trust Relationships ({len(findings)}) ===")
+            print("Named in a trust policy but no sts:AssumeRole grant found;")
+            print("not exploitable paths, but cleanup candidates:\n")
+            for rank, finding in enumerate(findings, start=1):
+                print(
+                    f"{rank:>3}. {finding.get('identity', '?')}\n"
+                    f"     -> {finding.get('role', '?')}"
+                )
+
         path_finder.save_paths(paths)
         highlighted = {node for path in paths for node in path["nodes"]}
-        visualizer.build_visualization(graph, highlighted_nodes=highlighted)
+        visualizer.build_visualization(graph, highlighted_nodes=highlighted, informational_findings=findings)
         print(f"\nInteractive visualization: {visualizer.HTML_REPORT_PATH}")
         return 0
 

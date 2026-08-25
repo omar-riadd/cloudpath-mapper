@@ -34,7 +34,13 @@ from typing import Any
 
 import networkx as nx
 
-from cloud_path_mapper.config import GRAPH_PATH, RAW_EC2_PATH, RAW_IAM_PATH, RAW_S3_PATH
+from cloud_path_mapper.config import (
+    GRAPH_PATH,
+    INFORMATIONAL_FINDINGS_PATH,
+    RAW_EC2_PATH,
+    RAW_IAM_PATH,
+    RAW_S3_PATH,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +52,27 @@ S3_READ_ACTIONS = {"s3:GetObject", "s3:*", "*"}
 # Actions that grant the ability to call sts:AssumeRole. Case is
 # normalized to lowercase at match time (IAM actions are case-insensitive).
 ASSUME_ROLE_ACTIONS = {"sts:assumerole", "sts:*", "*"}
+
+# Attached managed policy name that implies full admin (case-insensitive).
+ADMIN_POLICY_NAME = "administratoraccess"
+
+# IAM write actions enabling persistence or further escalation even
+# without full admin. Stored lowercase; matched case-insensitively.
+IAM_WRITE_ACTIONS = {
+    "iam:createuser",
+    "iam:createpolicy",
+    "iam:attachuserpolicy",
+    "iam:attachrolepolicy",
+    "iam:putuserpolicy",
+    "iam:putrolepolicy",
+    "iam:updateassumerolepolicy",
+    "iam:createaccesskey",
+    "iam:createloginprofile",
+}
+
+# Service-level wildcard actions on Resource "*" for sensitive data
+# services. Stored lowercase.
+SENSITIVE_SERVICE_WILDCARDS = {"s3:*", "secretsmanager:*", "kms:*", "dynamodb:*", "rds:*"}
 
 # Resource wildcards meaning "every bucket in every account".
 S3_GLOBAL_RESOURCES = {"*", "arn:aws:s3:::*"}
@@ -158,6 +185,57 @@ def _resource_matches_arn(pattern: str, target_arn: str) -> bool:
     return pattern == target_arn or fnmatch.fnmatchcase(target_arn, pattern)
 
 
+def _role_targets(stmt: dict, role_arns: set[str]) -> set[str]:
+    """Extract role ARNs matched by a statement's Resources.
+
+    Args:
+        stmt: Policy statement dict.
+        role_arns: Candidate role ARNs from the account scan.
+
+    Returns:
+        Set of role ARNs whose ARN matches at least one Resource.
+    """
+    return {
+        role_arn
+        for role_arn in role_arns
+        if any(_resource_matches_arn(res, role_arn) for res in _as_list(stmt.get("Resource")))
+    }
+
+
+def _has_wildcard_resource(stmt: dict) -> bool:
+    """Check whether a statement's Resources include a bare wildcard.
+
+    Args:
+        stmt: Policy statement dict.
+
+    Returns:
+        True if any Resource entry is exactly ``*``.
+    """
+    return "*" in {res.strip() for res in _as_list(stmt.get("Resource"))}
+
+
+def _denies_cover(denies: list[dict], actions_lower: set[str]) -> bool:
+    """Conservative Deny check for a set of candidate actions.
+
+    A Deny statement suppresses flagging when its Action list includes
+    one of the candidate actions or a covering wildcard. Condition and
+    NotAction semantics are not evaluated (documented limitation).
+
+    Args:
+        denies: Deny statements harvested for the identity.
+        actions_lower: Lowercased action strings to test.
+
+    Returns:
+        True if any Deny statement covers all/any of the actions.
+    """
+    for stmt in denies:
+        for action in _as_list(stmt.get("Action")):
+            lowered = str(action).lower()
+            if lowered == "*" or lowered in actions_lower:
+                return True
+    return False
+
+
 def _bucket_names_from_resources(resources: Any) -> set[str]:
     """Extract concrete bucket names from statement Resources.
 
@@ -185,6 +263,9 @@ class AttackGraphBuilder:
         iam: Raw IAM snapshot.
         s3: Raw S3 snapshot.
         ec2: Raw EC2 snapshot.
+        informational_findings: Half-configured relationships (e.g.,
+            ``TrustedButNoGrant``) that are not exploitable edges but
+            are surfaced for reviewer attention.
     """
 
     def __init__(self, iam_snapshot: dict, s3_snapshot: dict, ec2_snapshot: dict) -> None:
@@ -196,6 +277,7 @@ class AttackGraphBuilder:
             ec2_snapshot: Snapshot from the EC2 collector.
         """
         self.graph = nx.DiGraph()
+        self.informational_findings: list[dict] = []
         self.iam = iam_snapshot
         self.s3 = s3_snapshot
         self.ec2 = ec2_snapshot
@@ -212,6 +294,7 @@ class AttackGraphBuilder:
         self._add_trust_edges()
         self._add_instance_profile_edges()
         self._add_s3_permission_edges()
+        self._tag_high_value_targets()
 
         logger.info(
             "Graph built: %d nodes, %d edges", self.graph.number_of_nodes(), self.graph.number_of_edges()
@@ -285,31 +368,34 @@ class AttackGraphBuilder:
     # ------------------------------------------------------------------
 
     def _add_trust_edges(self) -> None:
-        """Draw ``CanAssumeRole`` edges using two-sided resolution.
+        """Draw ``CanAssumeRole`` edges using unified two-sided resolution.
 
-        Two passes run here:
+        Assuming a role in AWS requires BOTH a trust-side grant (the
+        role's policy permits the identity) AND a permission-side grant
+        (the identity's policies permit ``sts:AssumeRole`` on the role).
+        This method evaluates every candidate pair against both sides:
 
-        **Pass 1 (direct naming, unchanged behavior):** for each role,
-        parse ``assume_role_policy_document`` Allow statements and
-        connect every principal ARN that matches a user or role already
-        in the graph. Wildcard principals (``"*"``) are not expanded
-        into N edges; instead the target role carries the boolean node
-        attribute ``trust_wildcard`` for the rule engine to flag.
+        **Trust-side** (from :meth:`_summarize_role_trusts`):
+            - ``named`` — the trust policy names the identity's ARN
+              specifically,
+            - ``root`` — the trust policy trusts the same-account root
+              (``arn:aws:iam::<account>:root``) without a blocking
+              Condition,
+            - ``none`` — otherwise (no exploitable relationship).
 
-        **Pass 2 (root trust + permission backing):** roles commonly
-        trust their own account root (``arn:aws:iam::<account>:root``)
-        rather than naming specific principals. In that case "who can
-        assume this role" is answered by *permission policies*: an edge
-        is created only when BOTH sides check out —
+        **Permission-side** (from :meth:`_assume_role_grants`):
+            Allow statements on ``sts:AssumeRole`` (including wildcards)
+            across attached managed, inline, and inherited group
+            policies, with Resource matched by glob against role ARNs
+            and explicit Denys winning per AWS evaluation order.
 
-        - the identity's policies (attached managed + inline + inherited
-          group policies) contain an Allow on ``sts:AssumeRole`` whose
-          Resource matches the role's ARN, and
-        - the target role's trust policy trusts the same-account root
-          without a blocking Condition.
+        An edge is created only when both sides check out. A trust-side
+        ``named`` result with NO matching permission grant is recorded
+        as an informational finding of type ``TrustedButNoGrant``
+        (half-configured relationship) instead of an edge, so reviewers
+        see it without it counting as an exploitable attack step.
         """
-        self._add_named_principal_edges()
-        self._add_permission_backed_assume_edges()
+        self._add_assume_role_edges()
 
     def _add_instance_profile_edges(self) -> None:
         """Draw ``HasInstanceProfile`` edges from EC2 instances to roles.
@@ -348,33 +434,80 @@ class AttackGraphBuilder:
                 else:
                     logger.warning("Profile %s references unknown role %s", profile_arn, role_arn)
 
-    def _add_named_principal_edges(self) -> None:
-        """Pass 1: direct trust-policy principal naming (unchanged).
+    def _add_assume_role_edges(self) -> None:
+        """Create all ``CanAssumeRole`` edges via one two-sided check.
 
-        KNOWN LIMITATION: edges created here do not verify that the
-        named identity actually holds an ``sts:AssumeRole`` permission
-        on the role; the trust policy alone is treated as sufficient.
-        Kept for backward compatibility with the MVP behavior.
+        Candidate pairs are collected from the trust side (named
+        principals, plus permission-side candidates for root-trusted
+        roles), then each candidate is confirmed against the
+        permission-side grants before an edge is emitted. Pairs that
+        pass the trust side but lack a permission grant are recorded in
+        :attr:`informational_findings` as ``TrustedButNoGrant``.
         """
-        known_principals = {
-            n for n, attrs in self.graph.nodes(data=True)
-            if attrs.get("node_type") in ("user", "role")
-        }
+        trusts = self._summarize_role_trusts()
+        grants = self._assume_role_grants()
 
-        for role in self.iam.get("roles", []):
-            for stmt in _iter_statements(role.get("trust_policy") or {}):
-                principals = _principal_aws(stmt)
-                for principal in principals:
-                    if principal == "*":
-                        continue
-                    if principal in known_principals:
-                        self.graph.add_edge(
-                            principal,
-                            role["arn"],
-                            relation="CanAssumeRole",
-                            basis="named-principal",
-                        )
-                        logger.debug("Trust edge: %s -> %s", principal, role["name"])
+        # Trust-side candidates. Named principals take precedence over
+        # the coarser root-trust signal when both apply to a pair.
+        candidates: dict[tuple[str, str], str] = {}
+        for role_arn, info in trusts.items():
+            for principal in info["explicit"]:
+                if self.graph.has_node(principal):
+                    candidates.setdefault((principal, role_arn), "named-principal")
+
+        for identity_arn, (allowed, _denied) in grants.items():
+            if not self.graph.has_node(identity_arn):
+                continue
+            for role_arn in allowed:
+                info = trusts.get(role_arn)
+                if info and info["root_trusted"]:
+                    candidates.setdefault((identity_arn, role_arn), "root-trust")
+
+        # Two-sided confirmation.
+        for (identity_arn, role_arn), basis in sorted(candidates.items()):
+            allowed_targets = grants.get(identity_arn, (set(), set()))[0]
+            if role_arn not in allowed_targets:
+                self.informational_findings.append(
+                    {
+                        "type": "TrustedButNoGrant",
+                        "identity": identity_arn,
+                        "role": role_arn,
+                        "detail": (
+                            "Trust policy names this identity, but no sts:AssumeRole "
+                            "permission grant on this role was found in its policies."
+                        ),
+                    }
+                )
+                logger.info(
+                    "TrustedButNoGrant: %s is named in %s's trust policy but holds no "
+                    "sts:AssumeRole grant; recorded as informational only.",
+                    identity_arn,
+                    role_arn,
+                )
+                continue
+
+            self.graph.add_edge(
+                identity_arn,
+                role_arn,
+                relation="CanAssumeRole",
+                basis=basis,
+            )
+            logger.debug("Assume-role edge: %s -> %s (%s)", identity_arn, role_arn, basis)
+
+            if basis == "root-trust" and trusts[role_arn]["condition_present"]:
+                logger.warning(
+                    "Edge %s -> %s created from an unconditional statement, but the "
+                    "trust policy also contains Condition-blocked statement(s); "
+                    "conditions were NOT evaluated.",
+                    identity_arn,
+                    role_arn,
+                )
+
+        if self.informational_findings:
+            logger.info(
+                "Recorded %d TrustedButNoGrant informational finding(s)",
+                len(self.informational_findings),
+            )
 
     def _summarize_role_trusts(self) -> dict[str, dict]:
         """Classify each role's trust policy for resolution.
@@ -421,6 +554,31 @@ class AttackGraphBuilder:
             }
         return summary
 
+    def _harvest_effective_statements(self) -> dict[str, tuple[list[dict], list[dict]]]:
+        """Harvest Allow/Deny statements reachable by each identity.
+
+        Single shared pass over attached managed, inline, and
+        group-inherited policies; consumers (assume-role grant
+        resolution, high-value target tagging) evaluate their own
+        action/resource patterns against these statements.
+
+        Returns:
+            Mapping of identity ARN -> ``(allow_stmts, deny_stmts)``.
+        """
+        group_index = self._build_group_index()
+        harvested: dict[str, tuple[list[dict], list[dict]]] = {}
+        for identity in (*self.iam.get("users", []), *self.iam.get("roles", [])):
+            allows: list[dict] = []
+            denies: list[dict] = []
+            for document in self._documents_for_identity(identity, group_index):
+                for stmt in _all_statements(document):
+                    if stmt.get("Effect") == "Allow":
+                        allows.append(stmt)
+                    elif stmt.get("Effect") == "Deny":
+                        denies.append(stmt)
+            harvested[identity["arn"]] = (allows, denies)
+        return harvested
+
     def _assume_role_grants(self) -> dict[str, tuple[set[str], set[str]]]:
         """Resolve sts:AssumeRole permissions per identity.
 
@@ -443,86 +601,31 @@ class AttackGraphBuilder:
             where both are sets of role ARNs.
         """
         role_arns = {r["arn"] for r in self.iam.get("roles", [])}
-        group_index = self._build_group_index()
 
         grants: dict[str, tuple[set[str], set[str]]] = {}
-        for identity in (*self.iam.get("users", []), *self.iam.get("roles", [])):
+        for identity_arn, (allows, denies) in self._harvest_effective_statements().items():
             allowed: set[str] = set()
             denied: set[str] = set()
 
-            for document in self._documents_for_identity(identity, group_index):
-                for stmt in _all_statements(document):
-                    if not _action_matches(stmt.get("Action"), ASSUME_ROLE_ACTIONS):
-                        continue
-                    targets = {
-                        role_arn
-                        for role_arn in role_arns
-                        if any(_resource_matches_arn(res, role_arn) for res in _as_list(stmt.get("Resource")))
-                    }
-                    if stmt.get("Effect") == "Allow":
-                        allowed.update(targets)
-                    elif stmt.get("Effect") == "Deny":
-                        denied.update(targets)
+            for stmt in allows:
+                if not _action_matches(stmt.get("Action"), ASSUME_ROLE_ACTIONS):
+                    continue
+                allowed.update(_role_targets(stmt, role_arns))
+            for stmt in denies:
+                if not _action_matches(stmt.get("Action"), ASSUME_ROLE_ACTIONS):
+                    continue
+                denied.update(_role_targets(stmt, role_arns))
 
             suppressed = allowed & denied
             if suppressed:
                 logger.warning(
                     "%s holds both Allow and Deny for sts:AssumeRole on %d role(s); "
                     "Deny wins per AWS evaluation order.",
-                    identity["arn"],
+                    identity_arn,
                     len(suppressed),
                 )
-            grants[identity["arn"]] = (allowed - denied, denied)
+            grants[identity_arn] = (allowed - denied, denied)
         return grants
-
-    def _add_permission_backed_assume_edges(self) -> None:
-        """Pass 2: edges for root-trusted roles backed by permissions.
-
-        For every (identity, role) pair where the identity's policies
-        grant ``sts:AssumeRole`` on the role, create the edge only if
-        the role's trust policy trusts the same-account root without a
-        blocking Condition. Trust policies naming a different specific
-        principal produce no edge from this pass (that restriction is
-        honored), though Pass 1 may still connect the explicitly named
-        principal independently.
-        """
-        trusts = self._summarize_role_trusts()
-
-        for identity_arn, (allowed, _denied) in self._assume_role_grants().items():
-            if not self.graph.has_node(identity_arn):
-                continue
-            for role_arn in allowed:
-                if not self.graph.has_node(role_arn):
-                    continue
-                info = trusts.get(role_arn)
-                if not info:
-                    continue
-
-                # Named-principal trusts restrict assumption to those
-                # specific identities; permission-side grants add nothing
-                # here (and Pass 1 already handled the named ones).
-                if not info["root_trusted"]:
-                    continue
-
-                if self.graph.has_edge(identity_arn, role_arn):
-                    continue
-
-                self.graph.add_edge(
-                    identity_arn,
-                    role_arn,
-                    relation="CanAssumeRole",
-                    basis="permission+root-trust",
-                )
-                logger.debug("Root-trust edge: %s -> %s", identity_arn, role_arn)
-
-                if info["condition_present"]:
-                    logger.warning(
-                        "Edge %s -> %s created from an unconditional statement, but the "
-                        "trust policy also contains Condition-blocked statement(s); "
-                        "conditions were NOT evaluated.",
-                        identity_arn,
-                        role_arn,
-                    )
 
     def _build_group_index(self) -> dict[str, list[dict]]:
         """Index group records by name.
@@ -621,6 +724,84 @@ class AttackGraphBuilder:
         added = self.graph.number_of_edges() - edge_count_before
         logger.info("Added %d CanRead edges", added)
 
+    def _tag_high_value_targets(self) -> None:
+        """Flag identities as high-value targets with explicit reasons.
+
+        Policy-content signals (Deny-aware, reusing the shared
+        statement harvest):
+
+        1. AdministratorAccess — attached managed policy of that name,
+           or any Allow of ``Action: *`` on ``Resource: *``.
+        2. IAM-write actions (persistence/escalation primitives) such
+           as ``iam:CreateAccessKey`` or ``iam:UpdateAssumeRolePolicy``.
+        3. Service-level wildcards (``s3:*`` etc.) on ``Resource: *``
+           for sensitive services.
+
+        The legacy name-based heuristic is kept as an additional cheap
+        signal (role names containing "admin") but no longer drives
+        detection alone. Each flagged node gets a ``target_reason``
+        attribute describing WHY, for display in reports.
+        """
+        harvested = self._harvest_effective_statements()
+        policy_meta = self.iam.get("policies", {})
+        flagged = 0
+
+        for identity in (*self.iam.get("users", []), *self.iam.get("roles", [])):
+            arn = identity["arn"]
+            if not self.graph.has_node(arn):
+                continue
+            allows, denies = harvested.get(arn, ([], []))
+            reasons: list[str] = []
+
+            # --- AdministratorAccess ---
+            attached_admin = any(
+                str(policy_meta.get(policy_arn, {}).get("name", "")).lower() == ADMIN_POLICY_NAME
+                for policy_arn in identity.get("attached_policy_arns", [])
+            )
+            wildcard_admin = any(
+                _action_matches(stmt.get("Action"), {"*"}) and _has_wildcard_resource(stmt)
+                for stmt in allows
+            )
+            if (attached_admin or wildcard_admin) and not _denies_cover(denies, {"*"}):
+                reasons.append("AdministratorAccess")
+
+            # --- IAM write actions (persistence / escalation primitives) ---
+            for stmt in allows:
+                for action in _as_list(stmt.get("Action")):
+                    lowered = str(action).lower()
+                    if lowered in IAM_WRITE_ACTIONS and not _denies_cover(denies, {lowered}):
+                        reasons.append(str(action))
+
+            # --- Sensitive service wildcards on Resource "*" ---
+            for stmt in allows:
+                if not _has_wildcard_resource(stmt):
+                    continue
+                for action in _as_list(stmt.get("Action")):
+                    lowered = str(action).lower()
+                    if lowered in SENSITIVE_SERVICE_WILDCARDS and not _denies_cover(denies, {lowered}):
+                        reasons.append(f"{action} on *")
+
+            # --- Legacy name-based heuristic (demoted to a hint) ---
+            # Kept as a cheap signal per MVP history, but it no longer
+            # drives target selection: a role merely named "*admin*"
+            # gets an ``admin_name_hint`` attribute instead of
+            # ``target_reason``, so path-finding ignores it.
+            node_attrs = self.graph.nodes[arn]
+            if (
+                "target_reason" not in node_attrs
+                and "admin" in str(node_attrs.get("name", "")).lower()
+            ):
+                node_attrs["admin_name_hint"] = True
+
+            # Dedupe, preserving order.
+            seen: set[str] = set()
+            unique_reasons = [r for r in reasons if not (r in seen or seen.add(r))]
+            if unique_reasons:
+                node_attrs["target_reason"] = "; ".join(unique_reasons)
+                flagged += 1
+
+        logger.info("Tagged %d high-value target(s)", flagged)
+
 
 def _principal_aws(statement: dict) -> list[str]:
     """Extract AWS principal identifiers from a trust statement.
@@ -670,6 +851,46 @@ def export_graph(graph: nx.DiGraph, output_path: Any = GRAPH_PATH) -> Any:
     return output_path
 
 
+def export_informational_findings(
+    findings: list[dict],
+    output_path: Any = INFORMATIONAL_FINDINGS_PATH,
+) -> Any:
+    """Persist informational (non-exploitable) findings to disk.
+
+    Args:
+        findings: Records from
+            :attr:`AttackGraphBuilder.informational_findings`.
+        output_path: Destination JSON path.
+
+    Returns:
+        The path written to.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"finding_count": len(findings), "findings": findings}
+    output_path.write_text(json.dumps(payload, indent=2))
+    logger.info("Informational findings written to %s", output_path)
+    return output_path
+
+
+def load_informational_findings(path: Any = INFORMATIONAL_FINDINGS_PATH) -> list[dict]:
+    """Load previously exported informational findings, if any.
+
+    Args:
+        path: Path to ``informational_findings.json``.
+
+    Returns:
+        List of finding records; empty list when the file does not
+        exist or cannot be parsed.
+    """
+    try:
+        return json.loads(path.read_text()).get("findings", [])
+    except FileNotFoundError:
+        return []
+    except json.JSONDecodeError as exc:
+        logger.warning("Could not parse %s: %s", path, exc)
+        return []
+
+
 def run(iam_path: Any = RAW_IAM_PATH, s3_path: Any = RAW_S3_PATH, ec2_path: Any = RAW_EC2_PATH) -> nx.DiGraph:
     """Load snapshots, build the graph, export it, and log statistics.
 
@@ -682,7 +903,8 @@ def run(iam_path: Any = RAW_IAM_PATH, s3_path: Any = RAW_S3_PATH, ec2_path: Any 
         The built :class:`networkx.DiGraph`.
     """
     iam, s3, ec2 = load_snapshots(iam_path=iam_path, s3_path=s3_path, ec2_path=ec2_path)
-    graph = AttackGraphBuilder(iam, s3, ec2).build()
+    builder = AttackGraphBuilder(iam, s3, ec2)
+    graph = builder.build()
 
     stats = graph_statistics(graph)
     logger.info(
@@ -691,4 +913,5 @@ def run(iam_path: Any = RAW_IAM_PATH, s3_path: Any = RAW_S3_PATH, ec2_path: Any 
         dict(stats["edges_by_relation"]),
     )
     export_graph(graph)
+    export_informational_findings(builder.informational_findings)
     return graph

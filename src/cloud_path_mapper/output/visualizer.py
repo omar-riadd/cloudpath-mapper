@@ -20,6 +20,7 @@ accounts with zero edges do not freeze the dropdown UI.
 
 from __future__ import annotations
 
+import html as html_module
 import logging
 from typing import Any
 
@@ -67,6 +68,8 @@ def _node_title(attrs: dict) -> str:
     lines = [f"<b>{attrs.get('arn', 'unknown')}</b>"]
     if attrs.get("region"):
         lines.append(f"region: {attrs['region']}")
+    if attrs.get("target_reason"):
+        lines.append(f"<b>HIGH-VALUE TARGET: {attrs['target_reason']}</b>")
     if attrs.get("node_type") == "s3_bucket":
         if attrs.get("publicly_exposed"):
             lines.append("<b>PUBLICLY EXPOSED</b>")
@@ -78,6 +81,7 @@ def _node_title(attrs: dict) -> str:
 def build_visualization(
     graph: nx.DiGraph,
     highlighted_nodes: set[str] | None = None,
+    informational_findings: list[dict] | None = None,
     output_path: Any = HTML_REPORT_PATH,
 ) -> Any:
     """Render the graph to an interactive, self-contained HTML file.
@@ -86,12 +90,15 @@ def build_visualization(
         graph: The :class:`networkx.DiGraph` from the analysis layer.
         highlighted_nodes: Optional set of ARNs on discovered attack
             paths; these get a thick yellow border.
+        informational_findings: Optional non-exploitable audit findings
+            (e.g., ``TrustedButNoGrant``) rendered in a side panel.
         output_path: Destination HTML path.
 
     Returns:
         The path written to.
     """
     highlighted_nodes = highlighted_nodes or set()
+    informational_findings = informational_findings or []
 
     net = Network(
         height="900px",
@@ -141,7 +148,7 @@ def build_visualization(
         )
 
     html = net.generate_html()
-    html = _post_process_html(html)
+    html = _post_process_html(html, informational_findings)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html)
@@ -149,10 +156,10 @@ def build_visualization(
     return output_path
 
 
-def _post_process_html(html: str) -> str:
+def _post_process_html(html: str, informational_findings: list[dict] | None = None) -> str:
     """Apply all runtime patches to the pyvis-generated HTML string.
 
-    Three fixes are applied, in order:
+    Four fixes are applied, in order:
 
     1. **TomSelect injection** — pyvis's remote template wires the
        select/filter menus to an outdated TomSelect build that never
@@ -164,9 +171,13 @@ def _post_process_html(html: str) -> str:
        freezes the UI. Guard clauses short-circuit before iteration.
     3. **Legend** — a fixed color-key overlay is injected since pyvis
        has no native legend support.
+    4. **Findings panel** — half-configured trust relationships are
+       rendered as an audit-findings overlay (not attack paths, but
+       real cleanup targets).
 
     Args:
         html: The raw HTML string produced by ``Network.generate_html``.
+        informational_findings: Non-exploitable findings to render.
 
     Returns:
         The fully patched HTML string.
@@ -174,6 +185,7 @@ def _post_process_html(html: str) -> str:
     html = _inject_tom_select(html)
     html = _inject_zero_edge_guards(html)
     html = _inject_legend(html)
+    html = _inject_findings_panel(html, informational_findings or [])
     return html
 
 
@@ -256,3 +268,40 @@ def _inject_legend(html: str) -> str:
     )
     marker = "<body>"
     return html.replace(marker, marker + "\n" + legend_html, 1)
+
+
+def _inject_findings_panel(html: str, findings: list[dict]) -> str:
+    """Inject a fixed bottom-right panel of half-configured trusts.
+
+    These are audit findings rather than attack paths: trust policies
+    that name an identity which holds no matching ``sts:AssumeRole``
+    grant — prime targets for a cleanup pass.
+
+    Args:
+        html: Raw pyvis HTML string.
+        findings: Records with ``identity`` and ``role`` keys.
+
+    Returns:
+        Patched HTML string; unchanged when there are no findings.
+    """
+    if not findings:
+        return html
+
+    items = "".join(
+        f'<li style="margin-bottom:6px;">'
+        f"<code>{html_module.escape(str(f.get('identity', '?')))}</code> "
+        f"&rarr; <code>{html_module.escape(str(f.get('role', '?')))}</code>"
+        f"</li>"
+        for f in findings
+    )
+    panel = (
+        '<div style="position:fixed;bottom:20px;right:20px;z-index:999;'
+        "background:#2c3e50ee;padding:12px 16px;border-radius:6px;color:white;"
+        'font-family:sans-serif;max-width:520px;font-size:13px;">'
+        f'<b>Half-Configured Trust Relationships ({len(findings)})</b>'
+        '<div style="margin-top:4px;color:#f39c12;">Named in trust policy but no '
+        "sts:AssumeRole grant found &mdash; cleanup candidates, not attack paths.</div>"
+        f'<ul style="margin:8px 0 0 18px;padding:0;">{items}</ul>'
+        "</div>\n"
+    )
+    return html.replace("<body>", "<body>\n" + panel, 1)

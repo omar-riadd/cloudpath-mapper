@@ -12,6 +12,7 @@ RAW_S3_PATH = DATA_DIR / "raw_s3.json"
 RAW_EC2_PATH = DATA_DIR / "raw_ec2.json"
 GRAPH_PATH = DATA_DIR / "graph.json"
 ATTACK_PATHS_PATH = DATA_DIR / "attack_paths.json"
+INFORMATIONAL_FINDINGS_PATH = DATA_DIR / "informational_findings.json"
 HTML_REPORT_PATH = DATA_DIR / "attack_paths.html"
 
 DEFAULT_PROFILE: str | None = None
