@@ -217,7 +217,6 @@ def main(argv: list[str] | None = None) -> int:
         path_finder.save_paths(paths)
         highlighted = {node for path in paths for node in path["nodes"]}
         visualizer.build_visualization(graph, highlighted_nodes=highlighted)
-        visualizer.inject_legend()
         print(f"\nInteractive visualization: {visualizer.HTML_REPORT_PATH}")
         return 0
 

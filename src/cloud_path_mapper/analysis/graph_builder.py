@@ -26,6 +26,7 @@ recomputing.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 from collections import Counter
@@ -41,6 +42,10 @@ logger = logging.getLogger(__name__)
 # wildcard resource. "*" is included because admin-style s3:*/* grants
 # are the most common real-world escalation primitive.
 S3_READ_ACTIONS = {"s3:GetObject", "s3:*", "*"}
+
+# Actions that grant the ability to call sts:AssumeRole. Case is
+# normalized to lowercase at match time (IAM actions are case-insensitive).
+ASSUME_ROLE_ACTIONS = {"sts:assumerole", "sts:*", "*"}
 
 # Resource wildcards meaning "every bucket in every account".
 S3_GLOBAL_RESOURCES = {"*", "arn:aws:s3:::*"}
@@ -94,6 +99,18 @@ def _as_list(value: Any) -> list:
     return value if isinstance(value, list) else [value]
 
 
+def _all_statements(document: dict) -> list[dict]:
+    """Extract every statement from a policy document, any Effect.
+
+    Args:
+        document: Parsed IAM policy document.
+
+    Returns:
+        All statement dicts regardless of Effect (Allow/Deny).
+    """
+    return [stmt for stmt in _as_list(document.get("Statement")) if isinstance(stmt, dict)]
+
+
 def _iter_statements(document: dict) -> list[dict]:
     """Extract Allow statements from a policy document.
 
@@ -103,13 +120,13 @@ def _iter_statements(document: dict) -> list[dict]:
     Returns:
         All statements whose Effect is ``Allow``.
     """
-    return [
-        stmt for stmt in _as_list(document.get("Statement")) if isinstance(stmt, dict) and stmt.get("Effect") == "Allow"
-    ]
+    return [stmt for stmt in _all_statements(document) if stmt.get("Effect") == "Allow"]
 
 
 def _action_matches(actions: Any, wanted: set[str]) -> bool:
     """Check whether a statement's Action list intersects `wanted`.
+
+    Matching is case-insensitive per IAM semantics.
 
     Args:
         actions: Statement Action field (scalar or list).
@@ -118,7 +135,27 @@ def _action_matches(actions: Any, wanted: set[str]) -> bool:
     Returns:
         True if any listed action matches.
     """
-    return any(action in wanted for action in _as_list(actions))
+    wanted_lower = {w.lower() for w in wanted}
+    return any(action.lower() in wanted_lower for action in _as_list(actions))
+
+
+def _resource_matches_arn(pattern: str, target_arn: str) -> bool:
+    """Check whether an IAM resource pattern covers a target ARN.
+
+    Uses glob semantics (``*`` and ``?``), which covers the common IAM
+    resource wildcard forms such as exact ARNs, ``role/path/*`` suffix
+    wildcards, and full ``*``.
+
+    Args:
+        pattern: Resource value from a policy statement.
+        target_arn: The concrete role ARN being tested.
+
+    Returns:
+        True if the pattern matches the target ARN.
+    """
+    if not isinstance(pattern, str):
+        return False
+    return pattern == target_arn or fnmatch.fnmatchcase(target_arn, pattern)
 
 
 def _bucket_names_from_resources(resources: Any) -> set[str]:
@@ -248,35 +285,31 @@ class AttackGraphBuilder:
     # ------------------------------------------------------------------
 
     def _add_trust_edges(self) -> None:
-        """Draw ``CanAssumeRole`` edges from role trust policies.
+        """Draw ``CanAssumeRole`` edges using two-sided resolution.
 
-        For each role, parse ``assume_role_policy_document`` Allow
-        statements and connect every principal ARN that matches a user
-        or role already in the graph: edge direction is principal ->
-        assumable role. Wildcard principals (``"*"``) are not expanded
+        Two passes run here:
+
+        **Pass 1 (direct naming, unchanged behavior):** for each role,
+        parse ``assume_role_policy_document`` Allow statements and
+        connect every principal ARN that matches a user or role already
+        in the graph. Wildcard principals (``"*"``) are not expanded
         into N edges; instead the target role carries the boolean node
-        attribute ``trust_wildcard`` for the rule engine to flag, since
-        expanding it would add no routing information to path-finding.
-        """
-        known_principals = {
-            n for n, attrs in self.graph.nodes(data=True)
-            if attrs.get("node_type") in ("user", "role")
-        }
+        attribute ``trust_wildcard`` for the rule engine to flag.
 
-        for role in self.iam.get("roles", []):
-            for stmt in _iter_statements(role.get("trust_policy") or {}):
-                principals = _principal_aws(stmt)
-                for principal in principals:
-                    if principal == "*":
-                        continue
-                    if principal in known_principals:
-                        self.graph.add_edge(
-                            principal,
-                            role["arn"],
-                            relation="CanAssumeRole",
-                            source_statement_effect="Allow",
-                        )
-                        logger.debug("Trust edge: %s -> %s", principal, role["name"])
+        **Pass 2 (root trust + permission backing):** roles commonly
+        trust their own account root (``arn:aws:iam::<account>:root``)
+        rather than naming specific principals. In that case "who can
+        assume this role" is answered by *permission policies*: an edge
+        is created only when BOTH sides check out —
+
+        - the identity's policies (attached managed + inline + inherited
+          group policies) contain an Allow on ``sts:AssumeRole`` whose
+          Resource matches the role's ARN, and
+        - the target role's trust policy trusts the same-account root
+          without a blocking Condition.
+        """
+        self._add_named_principal_edges()
+        self._add_permission_backed_assume_edges()
 
     def _add_instance_profile_edges(self) -> None:
         """Draw ``HasInstanceProfile`` edges from EC2 instances to roles.
@@ -315,6 +348,233 @@ class AttackGraphBuilder:
                 else:
                     logger.warning("Profile %s references unknown role %s", profile_arn, role_arn)
 
+    def _add_named_principal_edges(self) -> None:
+        """Pass 1: direct trust-policy principal naming (unchanged).
+
+        KNOWN LIMITATION: edges created here do not verify that the
+        named identity actually holds an ``sts:AssumeRole`` permission
+        on the role; the trust policy alone is treated as sufficient.
+        Kept for backward compatibility with the MVP behavior.
+        """
+        known_principals = {
+            n for n, attrs in self.graph.nodes(data=True)
+            if attrs.get("node_type") in ("user", "role")
+        }
+
+        for role in self.iam.get("roles", []):
+            for stmt in _iter_statements(role.get("trust_policy") or {}):
+                principals = _principal_aws(stmt)
+                for principal in principals:
+                    if principal == "*":
+                        continue
+                    if principal in known_principals:
+                        self.graph.add_edge(
+                            principal,
+                            role["arn"],
+                            relation="CanAssumeRole",
+                            basis="named-principal",
+                        )
+                        logger.debug("Trust edge: %s -> %s", principal, role["name"])
+
+    def _summarize_role_trusts(self) -> dict[str, dict]:
+        """Classify each role's trust policy for resolution.
+
+        Statements carrying a Condition are conservatively treated as
+        unresolvable (see module limitation notes): a root-trust
+        statement with a Condition neither grants nor is counted as
+        blocking — the role simply cannot be resolved via root trust,
+        and any matching permission-side grant logs a warning.
+
+        Returns:
+            Mapping of role ARN to ``{"explicit": set[str], "root_trusted":
+            bool, "condition_present": bool}``.
+        """
+        account_id = self.iam.get("account_id")
+        root_principal = f"arn:aws:iam::{account_id}:root"
+        bare_account = account_id or ""
+
+        summary: dict[str, dict] = {}
+        for role in self.iam.get("roles", []):
+            explicit: set[str] = set()
+            root_trusted = False
+            condition_present = False
+
+            for stmt in _iter_statements(role.get("trust_policy") or {}):
+                if stmt.get("Condition"):
+                    # Cannot evaluate condition semantics (sts:ExternalId,
+                    # aws:SourceIdentity, ...); treat as resolvable only
+                    # via other unconditional statements.
+                    condition_present = True
+                    continue
+                for principal in _principal_aws(stmt):
+                    if principal == "*":
+                        continue
+                    if principal == root_principal or principal == bare_account:
+                        root_trusted = True
+                    else:
+                        explicit.add(principal)
+
+            summary[role["arn"]] = {
+                "explicit": explicit,
+                "root_trusted": root_trusted,
+                "condition_present": condition_present,
+            }
+        return summary
+
+    def _assume_role_grants(self) -> dict[str, tuple[set[str], set[str]]]:
+        """Resolve sts:AssumeRole permissions per identity.
+
+        Parses every policy document reachable by each identity
+        (attached managed, inline, and inherited group policies) for
+        statements whose Action includes ``sts:AssumeRole`` (or a
+        wildcard covering it) and whose Resource matches a scanned
+        role's ARN. Resource patterns are matched with glob semantics
+        (``*``/``?``), so ``arn:aws:iam::<acct>:role/pivot/*`` style
+        grants resolve correctly.
+
+        Explicit Deny statements on the same action/resource pair
+        suppress the grant rather than being silently ignored.
+
+        Note (known limitation): SCPs, permission boundaries, and
+        session policies are out of scope for snapshot-based analysis.
+
+        Returns:
+            Mapping of identity ARN -> ``(allowed_targets, denied_targets)``
+            where both are sets of role ARNs.
+        """
+        role_arns = {r["arn"] for r in self.iam.get("roles", [])}
+        group_index = self._build_group_index()
+
+        grants: dict[str, tuple[set[str], set[str]]] = {}
+        for identity in (*self.iam.get("users", []), *self.iam.get("roles", [])):
+            allowed: set[str] = set()
+            denied: set[str] = set()
+
+            for document in self._documents_for_identity(identity, group_index):
+                for stmt in _all_statements(document):
+                    if not _action_matches(stmt.get("Action"), ASSUME_ROLE_ACTIONS):
+                        continue
+                    targets = {
+                        role_arn
+                        for role_arn in role_arns
+                        if any(_resource_matches_arn(res, role_arn) for res in _as_list(stmt.get("Resource")))
+                    }
+                    if stmt.get("Effect") == "Allow":
+                        allowed.update(targets)
+                    elif stmt.get("Effect") == "Deny":
+                        denied.update(targets)
+
+            suppressed = allowed & denied
+            if suppressed:
+                logger.warning(
+                    "%s holds both Allow and Deny for sts:AssumeRole on %d role(s); "
+                    "Deny wins per AWS evaluation order.",
+                    identity["arn"],
+                    len(suppressed),
+                )
+            grants[identity["arn"]] = (allowed - denied, denied)
+        return grants
+
+    def _add_permission_backed_assume_edges(self) -> None:
+        """Pass 2: edges for root-trusted roles backed by permissions.
+
+        For every (identity, role) pair where the identity's policies
+        grant ``sts:AssumeRole`` on the role, create the edge only if
+        the role's trust policy trusts the same-account root without a
+        blocking Condition. Trust policies naming a different specific
+        principal produce no edge from this pass (that restriction is
+        honored), though Pass 1 may still connect the explicitly named
+        principal independently.
+        """
+        trusts = self._summarize_role_trusts()
+
+        for identity_arn, (allowed, _denied) in self._assume_role_grants().items():
+            if not self.graph.has_node(identity_arn):
+                continue
+            for role_arn in allowed:
+                if not self.graph.has_node(role_arn):
+                    continue
+                info = trusts.get(role_arn)
+                if not info:
+                    continue
+
+                # Named-principal trusts restrict assumption to those
+                # specific identities; permission-side grants add nothing
+                # here (and Pass 1 already handled the named ones).
+                if not info["root_trusted"]:
+                    continue
+
+                if self.graph.has_edge(identity_arn, role_arn):
+                    continue
+
+                self.graph.add_edge(
+                    identity_arn,
+                    role_arn,
+                    relation="CanAssumeRole",
+                    basis="permission+root-trust",
+                )
+                logger.debug("Root-trust edge: %s -> %s", identity_arn, role_arn)
+
+                if info["condition_present"]:
+                    logger.warning(
+                        "Edge %s -> %s created from an unconditional statement, but the "
+                        "trust policy also contains Condition-blocked statement(s); "
+                        "conditions were NOT evaluated.",
+                        identity_arn,
+                        role_arn,
+                    )
+
+    def _build_group_index(self) -> dict[str, list[dict]]:
+        """Index group records by name.
+
+        Returns:
+            Mapping of group name -> list of group snapshot records.
+        """
+        index: dict[str, list[dict]] = {}
+        for group in self.iam.get("groups", []):
+            index.setdefault(group["name"], []).append(group)
+        return index
+
+    def _documents_for_identity(
+        self,
+        identity: dict,
+        group_index: dict[str, list[dict]] | None = None,
+    ) -> list[dict]:
+        """Collect all policy documents applying to one identity.
+
+        Includes directly attached managed policies (resolved
+        documents), inline policies embedded in the identity record,
+        and — for users — attached + inline policies of their groups.
+
+        Args:
+            identity: A user or role record from the IAM snapshot.
+            group_index: Optional prebuilt group index (built on demand
+                when omitted).
+
+        Returns:
+            List of parsed policy documents to evaluate.
+        """
+        if group_index is None:
+            group_index = self._build_group_index()
+
+        docs: list[dict] = []
+        policy_docs = self.iam.get("policies", {})
+
+        def harvest(entity: dict) -> None:
+            for arn in entity.get("attached_policy_arns", []):
+                meta = policy_docs.get(arn, {})
+                if "document" in meta:
+                    docs.append(meta["document"])
+            docs.extend(p for p in entity.get("inline_policies", {}).values() if isinstance(p, dict))
+
+        harvest(identity)
+
+        if identity.get("type") == "user":
+            for membership in identity.get("groups", []):
+                for group in group_index.get(membership["group_name"], []):
+                    harvest(group)
+        return docs
+
     def _add_s3_permission_edges(self) -> None:
         """Draw ``CanRead`` edges from identities to S3 buckets.
 
@@ -330,45 +590,14 @@ class AttackGraphBuilder:
         NetworkX DiGraphs key edges by endpoint pair.
         """
         bucket_names = {b["name"] for b in self.s3.get("buckets", [])}
-        policy_docs = self.iam.get("policies", {})
-
-        def documents_for_identity(identity: dict, group_map: dict[str, list[dict]]) -> list[dict]:
-            """Collect all policy documents applying to one identity.
-
-            Args:
-                identity: A user or role record from the IAM snapshot.
-                group_map: Group name -> list of group records (users).
-
-            Returns:
-                List of parsed policy documents to evaluate.
-            """
-            docs: list[dict] = []
-
-            def harvest(entity: dict) -> None:
-                for arn in entity.get("attached_policy_arns", []):
-                    meta = policy_docs.get(arn, {})
-                    if "document" in meta:
-                        docs.append(meta["document"])
-                docs.extend(p for p in entity.get("inline_policies", {}).values() if isinstance(p, dict))
-
-            harvest(identity)
-
-            if identity.get("type") == "user":
-                for membership in identity.get("groups", []):
-                    for group in group_map.get(membership["group_name"], []):
-                        harvest(group)
-            return docs
-
-        group_index: dict[str, list[dict]] = {}
-        for group in self.iam.get("groups", []):
-            group_index.setdefault(group["name"], []).append(group)
+        group_index = self._build_group_index()
 
         edge_count_before = self.graph.number_of_edges()
         for identity in (*self.iam.get("users", []), *self.iam.get("roles", [])):
             source_arn = identity["arn"]
             if not self.graph.has_node(source_arn):
                 continue
-            for document in documents_for_identity(identity, group_index):
+            for document in self._documents_for_identity(identity, group_index):
                 for stmt in _iter_statements(document):
                     if not _action_matches(stmt.get("Action"), S3_READ_ACTIONS):
                         continue

@@ -1,8 +1,8 @@
-# Cloud Attack Path Mapper
+# CloudPath Mapper
 
 Most AWS security tools stop at checklists: *"this bucket is public," "this policy is over-permissive."* Findings like these ignore the question that actually matters during an incident — **what could an attacker do with them?**
 
-Cloud Attack Path Mapper answers that question. It collects IAM, S3, and EC2 posture from an AWS account, models the results as a **directed privilege graph** (BloodHound-style), and enumerates concrete attack paths that chain individual misconfigurations into full compromise scenarios:
+CloudPath Mapper answers that question. It collects IAM, S3, and EC2 posture from an AWS account, models the results as a **directed privilege graph** (BloodHound-style), and enumerates concrete attack paths that chain individual misconfigurations into full compromise scenarios:
 
 ```
 Public EC2 instance → instance profile → SSM role → assume-role chain → admin role
@@ -19,6 +19,7 @@ Instead of 400 disconnected findings, you get the handful of paths that end at y
 - **Offline analysis pipeline** — collectors write raw JSON snapshots once; graph construction, path finding, and visualization run entirely offline against those files. Snapshots double as deterministic test fixtures.
 - **Effective permission resolution** — managed policies are resolved to full documents, inline policies are parsed, and users inherit group policies, so edges reflect what identities can *actually* do.
 - **Interactive visualization** — pyvis HTML report with color-coded node types, labeled attack-step edges, hover details (full ARNs, region, exposure status), and highlighted nodes on discovered paths.
+- **Robust UI failsafes** — the generated report's JavaScript is post-processed to stay fully functional even on clean accounts with zero vulnerabilities: dropdown filters are guarded against empty edge sets, a known pyvis TomSelect defect is patched with a stable CDN build, and CDN-based assets keep the report rendering over `file://`.
 
 ## How It Works
 
@@ -36,15 +37,15 @@ Instead of 400 disconnected findings, you get the handful of paths that end at y
    - `HasInstanceProfile` — EC2 instance → embedded IAM role (the compute-to-identity bridge)
    - `CanRead` — identity → S3 bucket, derived from resolved policy documents (including wildcard-resource grants)
 3. **Path Finder** (`engine/path_finder.py`) enumerates simple paths from entry points (users, EC2 instances) to high-value targets (S3 buckets, `*admin*` roles) with a configurable hop cutoff.
-4. **Visualizer** (`output/visualizer.py`) renders the graph to an interactive HTML report with discovered paths highlighted.
+4. **Visualizer** (`output/visualizer.py`) renders the graph through a single `_post_process_html` pipeline — legend injection, TomSelect repair, and zero-edge UI guards — producing one self-contained interactive HTML file.
 
 ## Installation
 
 Requires Python 3.10+.
 
 ```bash
-git clone https://github.com/<your-username>/cloud-attack-path-mapper.git
-cd cloud-attack-path-mapper
+git clone https://github.com/omar-riadd/cloudpath-mapper.git
+cd cloudpath-mapper
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -62,7 +63,7 @@ Configure a profile with read-only permissions:
 aws configure --profile audit-readonly
 ```
 
-A profile with `ReadOnlyAccess` (or a scoped-down equivalent covering `sts:GetCallerIdentity`, `iam:*` reads, `s3:` bucket-policy reads, and `ec2:Describe*`) is sufficient. See [`iam-collector` required actions](#usage) — nothing is written to your account.
+A profile with `ReadOnlyAccess` (or a scoped-down equivalent covering `sts:GetCallerIdentity`, IAM reads, S3 bucket-policy reads, and `ec2:Describe*`) is sufficient. Nothing is ever written to your account.
 
 ## Usage
 
@@ -82,20 +83,18 @@ cloud-path-mapper analyze
 cloud-path-mapper report [--cutoff 5]
 ```
 
-Outputs, all under `data/`:
+The final step produces a **single, self-contained interactive HTML file** in the `data/` directory — open it in any browser, no server or local dependencies required:
 
 | File | Contents |
 |---|---|
 | `raw_iam.json`, `raw_s3.json`, `raw_ec2.json` | Raw collector snapshots (reusable as test fixtures) |
 | `graph.json` | Node-link export of the attack graph |
 | `attack_paths.json` | Discovered paths (entry, target, hops, node chain) |
-| `attack_paths.html` | Interactive pyvis visualization |
-
-Open `data/attack_paths.html` in any browser to explore the graph.
+| `attack_paths.html` | Self-contained interactive attack graph |
 
 ### Try it without an AWS account
 
-The pipeline runs fully offline against snapshot files, making it easy to demo with [CloudGoat](https://github.com/RhinoSecurityLabs/cloudgoat) or hand-crafted fixtures: drop JSON snapshots matching the collector output format into `data/`, then run `analyze` and `report`.
+The pipeline runs fully offline against snapshot files, making it easy to demo with [CloudGoat](https://github.com/RhinoSecurityLabs/cloudgoat) or hand-crafted fixtures: drop JSON snapshots matching the collector output format into `data/`, then run `analyze` and `report`. Even a completely clean account works — the report renders an empty-but-functional UI rather than freezing.
 
 ## Demo
 
@@ -111,3 +110,9 @@ The pipeline runs fully offline against snapshot files, making it easy to demo w
 ## Disclaimer
 
 This tool performs read-only reconnaissance of your own AWS accounts. Only run it against accounts you are authorized to assess.
+
+## Author
+
+**Omar Mohamed**
+
+Repository: [github.com/omar-riadd/cloudpath-mapper](https://github.com/omar-riadd/cloudpath-mapper)

@@ -6,9 +6,16 @@ Converts the NetworkX attack graph into an interactive HTML page with:
       EC2 instances=red, S3 buckets=blue),
     - entity names as labels and full ARN + region in hover tooltips,
     - edge ``relation`` labels (CanAssumeRole, CanRead, ...) rendered
-      on the arrows,
+      on the arrows with high-contrast white fonts,
     - nodes participating in discovered attack paths outlined in
-      yellow so the interesting subgraph stands out.
+      yellow so the interesting subgraph stands out,
+    - a fixed color legend in the bottom-left corner.
+
+The generated HTML is post-processed (:func:`_post_process_html`) to
+work around known pyvis issues when ``cdn_resources="remote"`` is used:
+a working TomSelect build is injected so the select/filter menus are
+live, and guard clauses are patched into the menu JavaScript so clean
+accounts with zero edges do not freeze the dropdown UI.
 """
 
 from __future__ import annotations
@@ -16,13 +23,14 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import networkx as nx
 from pyvis.network import Network
 
 from cloud_path_mapper.config import HTML_REPORT_PATH
 
 logger = logging.getLogger(__name__)
 
-# node_type -> (fill color, legend label)
+# node_type -> fill color
 NODE_COLORS: dict[str, str] = {
     "user": "#2ecc71",        # green
     "role": "#e67e22",        # orange
@@ -38,6 +46,13 @@ PATH_HIGHLIGHT_BORDER = "#f1c40f"
 # dead. Injecting the current stable release explicitly fixes them.
 TOM_SELECT_CSS = "https://cdn.jsdelivr.net/npm/tom-select@2.2.2/dist/css/tom-select.css"
 TOM_SELECT_JS = "https://cdn.jsdelivr.net/npm/tom-select@2.2.2/dist/js/tom-select.complete.min.js"
+
+EDGE_FONT_CONFIG = {
+    "color": "#ffffff",
+    "size": 14,
+    "strokeWidth": 2,
+    "strokeColor": "#1e1e1e",
+}
 
 
 def _node_title(attrs: dict) -> str:
@@ -61,11 +76,11 @@ def _node_title(attrs: dict) -> str:
 
 
 def build_visualization(
-    graph: Any,
+    graph: nx.DiGraph,
     highlighted_nodes: set[str] | None = None,
     output_path: Any = HTML_REPORT_PATH,
 ) -> Any:
-    """Render the graph to an interactive pyvis HTML file.
+    """Render the graph to an interactive, self-contained HTML file.
 
     Args:
         graph: The :class:`networkx.DiGraph` from the analysis layer.
@@ -104,7 +119,10 @@ def build_visualization(
             color={
                 "border": PATH_HIGHLIGHT_BORDER if on_path else NODE_COLORS.get(node_type, DEFAULT_COLOR),
                 "background": NODE_COLORS.get(node_type, DEFAULT_COLOR),
-                "highlight": {"border": PATH_HIGHLIGHT_BORDER, "background": NODE_COLORS.get(node_type, DEFAULT_COLOR)},
+                "highlight": {
+                    "border": PATH_HIGHLIGHT_BORDER,
+                    "background": NODE_COLORS.get(node_type, DEFAULT_COLOR),
+                },
             },
             borderWidth=4 if on_path else 1,
             shape="dot",
@@ -119,59 +137,111 @@ def build_visualization(
             label=relation,
             title=relation,
             arrows="to",
-            font={
-                "color": "#ffffff",
-                "size": 14,
-                "strokeWidth": 2,
-                "strokeColor": "#1e1e1e",
-            },
+            font=dict(EDGE_FONT_CONFIG),
         )
 
+    html = net.generate_html()
+    html = _post_process_html(html)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    net.save_graph(str(output_path))
-    _inject_tom_select(output_path)
+    output_path.write_text(html)
     logger.info("Interactive visualization written to %s", output_path)
     return output_path
 
 
-def _inject_tom_select(output_path: Any) -> Any:
-    """Patch the saved HTML with a working TomSelect build.
+def _post_process_html(html: str) -> str:
+    """Apply all runtime patches to the pyvis-generated HTML string.
 
-    pyvis's remote-CDN template wires its filter/select dropdowns to
-    TomSelect but references a release-candidate build that never
-    initializes, so the menus render but do not respond. This injects
-    the stable 2.2.2 CSS + JS from jsdelivr into ``<head>``; the
-    later-loaded stable version takes over the same bindings.
+    Three fixes are applied, in order:
+
+    1. **TomSelect injection** — pyvis's remote template wires the
+       select/filter menus to an outdated TomSelect build that never
+       initializes; injecting the stable 2.2.2 release makes the menus
+       live.
+    2. **Zero-edge guards** — the ``addProperties()`` and
+       ``addValues()`` menu functions iterate over ``allEdges`` when
+       the user selects "edge"; on a clean account with no edges this
+       freezes the UI. Guard clauses short-circuit before iteration.
+    3. **Legend** — a fixed color-key overlay is injected since pyvis
+       has no native legend support.
 
     Args:
-        output_path: The HTML file produced by :func:`build_visualization`.
+        html: The raw HTML string produced by ``Network.generate_html``.
 
     Returns:
-        The path written to.
+        The fully patched HTML string.
     """
+    html = _inject_tom_select(html)
+    html = _inject_zero_edge_guards(html)
+    html = _inject_legend(html)
+    return html
+
+
+def _inject_tom_select(html: str) -> str:
+    """Inject a working TomSelect CSS/JS pair into ``<head>``.
+
+    Args:
+        html: Raw pyvis HTML string.
+
+    Returns:
+        Patched HTML string.
+    """
+    if TOM_SELECT_JS in html:
+        return html
     tags = (
         f'<link href="{TOM_SELECT_CSS}" rel="stylesheet">\n'
         f'<script src="{TOM_SELECT_JS}"></script>\n'
     )
-    content = output_path.read_text()
-    if TOM_SELECT_JS in content:
-        return output_path
-    patched = content.replace("</head>", tags + "</head>", 1)
-    output_path.write_text(patched)
-    return output_path
+    return html.replace("</head>", tags + "</head>", 1)
 
 
-def inject_legend(output_path: Any = HTML_REPORT_PATH) -> Any:
-    """Prepend a static color legend to the generated HTML report.
+def _inject_zero_edge_guards(html: str) -> str:
+    """Patch menu JavaScript to tolerate graphs with zero edges.
 
-    pyvis does not render legends natively; this injects a small fixed
-    overlay div into the saved file.
+    Uses targeted ``str.replace`` calls against the exact function
+    bodies pyvis emits for ``addProperties()`` and ``addValues()``.
+    When the user picks "edge" in the filter menus, the injected guard
+    returns immediately instead of iterating an empty ``allEdges``
+    object, which otherwise leaves the dropdown unresponsive.
+
+    Idempotent: re-running on already-patched content is a no-op.
 
     Args:
-        output_path: The HTML file produced by :func:`build_visualization`.
+        html: Raw pyvis HTML string.
 
     Returns:
-        The path written to.
+        Patched HTML string.
+    """
+    guard = "if (!allEdges || Object.keys(allEdges).length === 0) { return; }"
+
+    add_values_marker = "else if (filter['item'] === 'edge') {"
+    if add_values_marker in html and guard not in html[html.index(add_values_marker):][:200]:
+        html = html.replace(
+            add_values_marker,
+            f"{add_values_marker} {guard}",
+        )
+
+    add_properties_marker = "if (arguments[0] === 'edge') {"
+    if (
+        add_properties_marker in html
+        and guard not in html[html.index(add_properties_marker):][:200]
+    ):
+        html = html.replace(
+            add_properties_marker,
+            f"{add_properties_marker} {guard}",
+        )
+
+    return html
+
+
+def _inject_legend(html: str) -> str:
+    """Prepend a fixed bottom-left color legend after ``<body>``.
+
+    Args:
+        html: Raw pyvis HTML string.
+
+    Returns:
+        Patched HTML string.
     """
     legend_items = "".join(
         f'<span style="margin-right:16px;"><span style="display:inline-block;width:12px;height:12px;'
@@ -182,12 +252,7 @@ def inject_legend(output_path: Any = HTML_REPORT_PATH) -> Any:
         '<div style="position:fixed;bottom:20px;left:20px;z-index:999;background:#1e1e1ecc;'
         f'padding:10px 14px;border-radius:6px;color:white;font-family:sans-serif;">'
         f'<b>Node types:</b> {legend_items}'
-        f'<span style="display:inline-block;width:12px;height:2px;background:#fff;margin-right:5px;'
-        'border-bottom:2px dashed #fff;"></span>'
         "</div>\n"
     )
-    content = output_path.read_text()
     marker = "<body>"
-    patched = content.replace(marker, marker + "\n" + legend_html, 1)
-    output_path.write_text(patched)
-    return output_path
+    return html.replace(marker, marker + "\n" + legend_html, 1)

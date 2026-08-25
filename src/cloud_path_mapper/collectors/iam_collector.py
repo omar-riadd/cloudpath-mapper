@@ -292,7 +292,7 @@ class IAMCollector:
         """
         inline: dict[str, dict[str, Any]] = {}
         try:
-            names = [p["PolicyName"] for page in ops.list_inline() for p in page["PolicyNames"]]
+            names = [p for page in ops.list_inline() for p in page["PolicyNames"]]
             for name in names:
                 response = ops.get_inline(name)
                 doc = response["PolicyDocument"]
