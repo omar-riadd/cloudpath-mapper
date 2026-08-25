@@ -134,6 +134,6 @@ This tool performs read-only reconnaissance of your own AWS accounts. Only run i
 
 ## Author
 
-**Omar Mohamed**
+**Omar Riad**
 
 Repository: [github.com/omar-riadd/cloudpath-mapper](https://github.com/omar-riadd/cloudpath-mapper)
